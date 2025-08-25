@@ -264,7 +264,7 @@ class RaceCar(object):
         Returns:
             current_scan
         """
-
+        # TODO: Add imu data to (linear acc along xyz, angular velocity along xyz)
         # state is [x, y, steer_angle, vel, yaw_angle, yaw_rate, slip_angle]
 
         # steering delay
@@ -370,7 +370,7 @@ class RaceCar(object):
                 self.params['v_max'])
 
             # dynamics integration
-            self.state = self.state + self.time_step*(1/6)*(k1 + 2*k2 + 2*k3 + k4)
+            self.new_state = self.state + self.time_step*(1/6)*(k1 + 2*k2 + 2*k3 + k4)
         
         elif self.integrator is Integrator.Euler:
             f = vehicle_dynamics_st(
@@ -392,10 +392,15 @@ class RaceCar(object):
                 self.params['a_max'],
                 self.params['v_min'],
                 self.params['v_max'])
-            self.state = self.state + self.time_step * f
-        
+            self.new_state = self.state + self.time_step * f
         else:
             raise SyntaxError(f"Invalid Integrator Specified. Provided {self.integrator.name}. Please choose RK4 or Euler")
+
+        # TODO: convert state diff data into linear and angular velocities 
+        # state = [x, y, theta, vel, steer_angle, ang_vel, slip_angle]
+        # For IMU, angular_velocity_x =  angular_velocity_x = 0 ; linear_acc_z = 0
+        imu = self.get_imu(self.new_state, self.state,  self.time_step)
+        self.state = self.new_state
 
         # bound yaw angle
         if self.state[4] > 2*np.pi:
@@ -410,7 +415,46 @@ class RaceCar(object):
         current_scan = RaceCar.scan_simulator.scan(scan_pose, self.scan_rng)
         # current_scan = RaceCar.scan_simulator.scan(np.append(self.state[0:2],  self.state[4]), self.scan_rng)
 
-        return current_scan
+        return current_scan, imu
+
+    def wrap_angle(self, angle):
+        return (angle + np.pi) % (2 * np.pi) - np.pi
+
+    def get_imu(self, new_state, state, timestep):
+        # Unpack old and new state
+        _, _, theta_old, v_old, _, omega_old, beta_old = state
+        _, _, theta_new, v_new, _, omega_new, beta_new = new_state
+
+        # Convert velocity magnitude and slip angle to global velocity components
+        vx_old_global = v_old * np.cos(theta_old + beta_old)
+        vy_old_global = v_old * np.sin(theta_old + beta_old)
+
+        vx_new_global = v_new * np.cos(theta_new + beta_new)
+        vy_new_global = v_new * np.sin(theta_new + beta_new)
+
+        # Compute global frame acceleration
+        ax_global = (vx_new_global - vx_old_global) / timestep
+        ay_global = (vy_new_global - vy_old_global) / timestep
+
+        # Rotate global acceleration into body frame using the *new* heading angle
+        cos_theta = np.cos(theta_new)
+        sin_theta = np.sin(theta_new)
+
+        ax_body =  ax_global * cos_theta + ay_global * sin_theta
+        ay_body = -ax_global * sin_theta + ay_global * cos_theta
+
+        # Compute angular velocity (yaw rate)
+        dtheta = self.wrap_angle(theta_new - theta_old)
+        angular_velocity_z = dtheta / timestep
+        yaw = self.wrap_angle(theta_new)  # normalized to [-pi, pi]
+
+        # Return simulated IMU data
+        return {
+            'linear_acceleration_x': ax_body,   # forward
+            'linear_acceleration_y': ay_body,   # lateral
+            'angular_velocity_z': angular_velocity_z,
+            'yaw': yaw
+        }
 
     def update_opp_poses(self, opp_poses):
         """
@@ -563,13 +607,13 @@ class Simulator(object):
 
 
         agent_scans = []
-
+        agent_imus = []
         # looping over agents
         for i, agent in enumerate(self.agents):
             # update each agent's pose
-            current_scan = agent.update_pose(control_inputs[i, 0], control_inputs[i, 1])
+            current_scan, imu = agent.update_pose(control_inputs[i, 0], control_inputs[i, 1])
             agent_scans.append(current_scan)
-
+            agent_imus.append(imu)
             # update sim's information of agent poses
             self.agent_poses[i, :] = np.append(agent.state[0:2], agent.state[4])
 
@@ -593,6 +637,7 @@ class Simulator(object):
         # collision_angles is removed from observations
         observations = {'ego_idx': self.ego_idx,
             'scans': [],
+            'imus': [],
             'poses_x': [],
             'poses_y': [],
             'poses_theta': [],
@@ -602,6 +647,7 @@ class Simulator(object):
             'collisions': self.collisions}
         for i, agent in enumerate(self.agents):
             observations['scans'].append(agent_scans[i])
+            observations['imus'].append(agent_imus[i])
             observations['poses_x'].append(agent.state[0])
             observations['poses_y'].append(agent.state[1])
             observations['poses_theta'].append(agent.state[4])
